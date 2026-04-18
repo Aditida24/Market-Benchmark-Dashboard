@@ -659,19 +659,15 @@ def solution_section(filtered: Dict[str, pd.DataFrame], metrics: Dict[str, objec
 st.title("📈 Market Benchmark & Tariff Strategy Dashboard")
 st.caption("Business-focused dashboard for DAM vs Settlement comparison, tariff selection, and benchmark strategy.")
 
-with st.sidebar:
-    uploaded_file = st.file_uploader(
-        "Upload workbook",
-        type=["xlsx"],
-        help="Workbook must include All_Profile_Summary, Profile_Overview, DAM, and Settlement.",
-    )
+DEFAULT_FILE = "Dataset _Dashboard.xlsx"
 
-if uploaded_file is None:
-    st.info("Upload your Excel workbook to generate the dashboard.")
-    st.stop()
+with st.sidebar:
+    uploaded_file = st.file_uploader("Upload a different workbook", type=["xlsx"])
+
+file_source = uploaded_file if uploaded_file is not None else DEFAULT_FILE
 
 try:
-    data = load_workbook(uploaded_file)
+    data = load_workbook(file_source)
 except Exception as e:
     st.error(f"Could not load workbook: {e}")
     st.stop()
