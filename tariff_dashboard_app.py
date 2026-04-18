@@ -1,92 +1,36 @@
 import io
-from typing import Dict, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 st.set_page_config(
-    page_title="Tariff Intelligence Dashboard",
-    page_icon="⚡",
+    page_title="Market Benchmark & Tariff Strategy Dashboard",
+    page_icon="📈",
     layout="wide",
 )
 
-# -----------------------------
-# Styling
-# -----------------------------
 st.markdown(
     """
     <style>
-    .main > div {
-        padding-top: 1.2rem;
-    }
-    .kpi-card {
-        padding: 0.85rem 1rem;
-        border: 1px solid rgba(49, 51, 63, 0.2);
-        border-radius: 18px;
-        background: rgba(255,255,255,0.02);
-    }
+    .main > div {padding-top: 1rem;}
     .insight-box {
         padding: 1rem 1.1rem;
         border-radius: 18px;
-        border-left: 4px solid #4F8BF9;
-        background: rgba(79,139,249,0.08);
+        border-left: 5px solid #2563eb;
+        background: rgba(37,99,235,0.08);
         margin-bottom: 0.8rem;
     }
-    .small-note {
-        color: #6b7280;
-        font-size: 0.92rem;
-    }
+    .small-note {color: #6b7280; font-size: 0.92rem;}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-REQUIRED_SHEETS = {
-    "All_Profile_Summary",
-    "Profile_Overview",
-    "DAM",
-    "Settlement",
-}
-
-SUMMARY_REQUIRED_COLS = {
-    "profile_name",
-    "rank",
-    "category",
-    "provider_name",
-    "tariff_option_name",
-    "annual_total_cost_eur",
-    "difference_vs_dam_10pct_eur",
-    "difference_vs_settlement_10pct_eur",
-    "cheaper_than_market",
-}
-
-PROFILE_REQUIRED_COLS = {
-    "profile_name",
-    "building_type",
-    "occupants",
-    "heating_system",
-    "floor_area_m2",
-    "how_many_evs",
-    "annual_appliances_kwh",
-    "annual_heating_kwh",
-    "annual_ev_kwh",
-    "annual_total_kwh",
-}
-
-DAM_REQUIRED_COLS = {
-    "trading_day",
-    "period",
-    "start_time_utc",
-    "price_eur_mwh",
-}
-
-SETTLEMENT_REQUIRED_COLS = {
-    "timestamp",
-    "settlement_price",
-    "predicted_settlement_price",
-}
+REQUIRED_SHEETS = {"All_Profile_Summary", "Profile_Overview", "DAM", "Settlement"}
 
 
 # -----------------------------
@@ -98,736 +42,664 @@ def eur(x: float, digits: int = 0) -> str:
     return f"€{x:,.{digits}f}"
 
 
-def num(x: float, digits: int = 1) -> str:
-    if pd.isna(x):
-        return "-"
-    return f"{x:,.{digits}f}"
-
-
 def pct(x: float, digits: int = 1) -> str:
     if pd.isna(x):
         return "-"
     return f"{x:.{digits}f}%"
 
 
-def safe_div(a: float, b: float) -> float:
-    if b in [0, None] or pd.isna(b):
+def num(x: float, digits: int = 1) -> str:
+    if pd.isna(x):
+        return "-"
+    return f"{x:,.{digits}f}"
+
+
+def safe_mean_abs_error(actual: pd.Series, predicted: pd.Series) -> float:
+    df = pd.concat([actual, predicted], axis=1).dropna()
+    if df.empty:
         return np.nan
-    return a / b
+    return np.mean(np.abs(df.iloc[:, 0] - df.iloc[:, 1]))
 
 
 @st.cache_data(show_spinner=False)
 def load_workbook(uploaded_file) -> Dict[str, pd.DataFrame]:
     xls = pd.ExcelFile(uploaded_file)
-    missing_sheets = REQUIRED_SHEETS - set(xls.sheet_names)
-    if missing_sheets:
-        raise ValueError(f"Missing required sheets: {sorted(missing_sheets)}")
+    missing = REQUIRED_SHEETS - set(xls.sheet_names)
+    if missing:
+        raise ValueError(f"Missing required sheets: {sorted(missing)}")
 
-    sheets = {
+    data = {
         "summary": pd.read_excel(uploaded_file, sheet_name="All_Profile_Summary"),
         "profiles": pd.read_excel(uploaded_file, sheet_name="Profile_Overview"),
         "dam": pd.read_excel(uploaded_file, sheet_name="DAM"),
         "settlement": pd.read_excel(uploaded_file, sheet_name="Settlement"),
     }
-    validate_structure(sheets)
-    return prepare_data(sheets)
+    return prepare_data(data)
 
 
+@st.cache_data(show_spinner=False)
+def prepare_data(data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    summary = data["summary"].copy()
+    profiles = data["profiles"].copy()
+    dam = data["dam"].copy()
+    settlement = data["settlement"].copy()
 
-def validate_structure(sheets: Dict[str, pd.DataFrame]) -> None:
-    summary_cols = set(sheets["summary"].columns)
-    profile_cols = set(sheets["profiles"].columns)
-    dam_cols = set(sheets["dam"].columns)
-    settlement_cols = set(sheets["settlement"].columns)
+    # Numeric cleanup
+    for col in [
+        "annual_total_cost_eur",
+        "difference_vs_dam_10pct_eur",
+        "difference_vs_settlement_10pct_eur",
+    ]:
+        if col in summary.columns:
+            summary[col] = pd.to_numeric(summary[col], errors="coerce")
 
-    missing = {
-        "All_Profile_Summary": sorted(SUMMARY_REQUIRED_COLS - summary_cols),
-        "Profile_Overview": sorted(PROFILE_REQUIRED_COLS - profile_cols),
-        "DAM": sorted(DAM_REQUIRED_COLS - dam_cols),
-        "Settlement": sorted(SETTLEMENT_REQUIRED_COLS - settlement_cols),
-    }
-    problems = {k: v for k, v in missing.items() if v}
-    if problems:
-        raise ValueError(f"Workbook structure issue: {problems}")
+    summary["rank"] = pd.to_numeric(summary.get("rank"), errors="coerce")
+    summary["cheaper_than_market"] = summary.get("cheaper_than_market", False).fillna(False).astype(bool)
 
+    for col in [
+        "occupants", "floor_area_m2", "how_many_evs",
+        "annual_appliances_kwh", "annual_heating_kwh", "annual_ev_kwh", "annual_total_kwh"
+    ]:
+        if col in profiles.columns:
+            profiles[col] = pd.to_numeric(profiles[col], errors="coerce")
 
-
-def prepare_data(sheets: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
-    summary = sheets["summary"].copy()
-    profiles = sheets["profiles"].copy()
-    dam = sheets["dam"].copy()
-    settlement = sheets["settlement"].copy()
-
-    # Summary cleaning
-    summary["annual_total_cost_eur"] = pd.to_numeric(summary["annual_total_cost_eur"], errors="coerce")
-    summary["difference_vs_dam_10pct_eur"] = pd.to_numeric(summary["difference_vs_dam_10pct_eur"], errors="coerce")
-    summary["difference_vs_settlement_10pct_eur"] = pd.to_numeric(summary["difference_vs_settlement_10pct_eur"], errors="coerce")
-    summary["cheaper_than_market"] = summary["cheaper_than_market"].fillna(False).astype(bool)
-
-    # Profile cleaning
-    numeric_profile_cols = [
-        "occupants", "floor_area_m2", "how_many_evs", "annual_appliances_kwh",
-        "annual_heating_kwh", "annual_ev_kwh", "annual_total_kwh"
-    ]
-    for col in numeric_profile_cols:
-        profiles[col] = pd.to_numeric(profiles[col], errors="coerce")
-
-    profiles["appliances_share_pct"] = 100 * profiles["annual_appliances_kwh"] / profiles["annual_total_kwh"]
-    profiles["heating_share_pct"] = 100 * profiles["annual_heating_kwh"] / profiles["annual_total_kwh"]
-    profiles["ev_share_pct"] = 100 * profiles["annual_ev_kwh"] / profiles["annual_total_kwh"]
-    profiles["dominant_load"] = profiles[["annual_appliances_kwh", "annual_heating_kwh", "annual_ev_kwh"]].idxmax(axis=1)
-    profiles["dominant_load"] = profiles["dominant_load"].map({
-        "annual_appliances_kwh": "Appliances",
-        "annual_heating_kwh": "Heating",
-        "annual_ev_kwh": "EV Charging",
-    })
-
-    # DAM cleaning
     dam["timestamp"] = pd.to_datetime(dam["start_time_utc"], errors="coerce", utc=True)
     dam["price_eur_mwh"] = pd.to_numeric(dam["price_eur_mwh"], errors="coerce")
     dam["month"] = dam["timestamp"].dt.to_period("M").astype(str)
+    dam["hour"] = dam["timestamp"].dt.hour
+    dam["weekday"] = dam["timestamp"].dt.day_name()
 
-    # Settlement cleaning
     settlement["timestamp"] = pd.to_datetime(settlement["timestamp"], errors="coerce", utc=True)
     settlement["settlement_price"] = pd.to_numeric(settlement["settlement_price"], errors="coerce")
     settlement["predicted_settlement_price"] = pd.to_numeric(settlement["predicted_settlement_price"], errors="coerce")
     settlement["month"] = settlement["timestamp"].dt.to_period("M").astype(str)
+    settlement["hour"] = settlement["timestamp"].dt.hour
+    settlement["weekday"] = settlement["timestamp"].dt.day_name()
 
-    supplier_summary = summary[summary["category"].eq("Supplier Tariff")].copy()
-    market_summary = summary[summary["category"].eq("Market Reference")].copy()
-
-    # Profile/provider view
-    provider_profile_cost = (
-        supplier_summary
-        .groupby(["profile_name", "provider_name"], as_index=False)["annual_total_cost_eur"]
-        .min()
+    market = pd.merge(
+        dam[["timestamp", "month", "hour", "weekday", "price_eur_mwh"]],
+        settlement[["timestamp", "month", "hour", "weekday", "settlement_price", "predicted_settlement_price"]],
+        on=["timestamp", "month", "hour", "weekday"],
+        how="inner",
+    )
+    market["spread_settlement_minus_dam"] = market["settlement_price"] - market["price_eur_mwh"]
+    market["spread_abs"] = market["spread_settlement_minus_dam"].abs()
+    market["better_market"] = np.where(
+        market["settlement_price"] < market["price_eur_mwh"],
+        "Settlement",
+        "DAM"
     )
 
-    # Best supplier per profile
-    idx_best_supplier = supplier_summary.groupby("profile_name")["annual_total_cost_eur"].idxmin()
-    best_supplier_per_profile = (
-        supplier_summary.loc[idx_best_supplier, [
+    monthly_market = market.groupby("month", as_index=False).agg(
+        avg_dam=("price_eur_mwh", "mean"),
+        avg_settlement=("settlement_price", "mean"),
+        avg_predicted_settlement=("predicted_settlement_price", "mean"),
+        avg_spread=("spread_settlement_minus_dam", "mean"),
+        avg_abs_spread=("spread_abs", "mean"),
+    )
+
+    hourly_market = market.groupby("hour", as_index=False).agg(
+        avg_dam=("price_eur_mwh", "mean"),
+        avg_settlement=("settlement_price", "mean"),
+        avg_spread=("spread_settlement_minus_dam", "mean"),
+    )
+
+    weekday_market = market.groupby("weekday", as_index=False).agg(
+        avg_dam=("price_eur_mwh", "mean"),
+        avg_settlement=("settlement_price", "mean"),
+        avg_spread=("spread_settlement_minus_dam", "mean"),
+    )
+    weekday_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    weekday_market["weekday"] = pd.Categorical(weekday_market["weekday"], categories=weekday_order, ordered=True)
+    weekday_market = weekday_market.sort_values("weekday")
+
+    supplier_only = summary[summary["category"].eq("Supplier Tariff")].copy()
+    benchmark_only = summary[summary["category"].eq("Market Reference")].copy()
+
+    best_supplier = (
+        supplier_only.sort_values(["profile_name", "annual_total_cost_eur"])
+        .groupby("profile_name", as_index=False)
+        .first()[[
             "profile_name", "provider_name", "tariff_option_name", "annual_total_cost_eur",
             "difference_vs_dam_10pct_eur", "difference_vs_settlement_10pct_eur", "cheaper_than_market"
         ]]
         .rename(columns={
             "provider_name": "best_supplier",
-            "tariff_option_name": "best_tariff",
+            "tariff_option_name": "best_supplier_tariff",
             "annual_total_cost_eur": "best_supplier_cost_eur",
-            "difference_vs_dam_10pct_eur": "best_diff_vs_dam_eur",
-            "difference_vs_settlement_10pct_eur": "best_diff_vs_settlement_eur",
+            "difference_vs_dam_10pct_eur": "best_vs_dam_eur",
+            "difference_vs_settlement_10pct_eur": "best_vs_settlement_eur",
             "cheaper_than_market": "best_cheaper_than_market",
         })
-        .reset_index(drop=True)
     )
 
-    # Best market reference per profile
-    idx_best_market = market_summary.groupby("profile_name")["annual_total_cost_eur"].idxmin()
-    best_market_per_profile = (
-        market_summary.loc[idx_best_market, ["profile_name", "provider_name", "tariff_option_name", "annual_total_cost_eur"]]
+    worst_supplier = (
+        supplier_only.sort_values(["profile_name", "annual_total_cost_eur"], ascending=[True, False])
+        .groupby("profile_name", as_index=False)
+        .first()[["profile_name", "provider_name", "tariff_option_name", "annual_total_cost_eur"]]
         .rename(columns={
-            "provider_name": "best_market_reference",
-            "tariff_option_name": "best_market_option",
-            "annual_total_cost_eur": "best_market_cost_eur",
+            "provider_name": "worst_supplier",
+            "tariff_option_name": "worst_supplier_tariff",
+            "annual_total_cost_eur": "worst_supplier_cost_eur",
         })
-        .reset_index(drop=True)
     )
 
-    # Tariff spread
-    tariff_spread = (
-        supplier_summary.groupby("profile_name", as_index=False)
-        .agg(
-            cheapest_supplier_cost_eur=("annual_total_cost_eur", "min"),
-            avg_supplier_cost_eur=("annual_total_cost_eur", "mean"),
-            most_expensive_supplier_cost_eur=("annual_total_cost_eur", "max"),
-            number_of_supplier_options=("tariff_option_name", "count"),
-        )
-    )
-    tariff_spread["switching_saving_eur"] = (
-        tariff_spread["most_expensive_supplier_cost_eur"] - tariff_spread["cheapest_supplier_cost_eur"]
+    best_benchmark = (
+        benchmark_only.sort_values(["profile_name", "annual_total_cost_eur"])
+        .groupby("profile_name", as_index=False)
+        .first()[["profile_name", "provider_name", "tariff_option_name", "annual_total_cost_eur"]]
+        .rename(columns={
+            "provider_name": "best_benchmark_provider",
+            "tariff_option_name": "best_benchmark_option",
+            "annual_total_cost_eur": "best_benchmark_cost_eur",
+        })
     )
 
-    profile_insights = (
-        profiles.merge(best_supplier_per_profile, on="profile_name", how="left")
-        .merge(best_market_per_profile, on="profile_name", how="left")
-        .merge(tariff_spread, on="profile_name", how="left")
+    profile_benchmark = (
+        profiles.merge(best_supplier, on="profile_name", how="left")
+        .merge(worst_supplier, on="profile_name", how="left")
+        .merge(best_benchmark, on="profile_name", how="left")
     )
-    profile_insights["retail_premium_vs_market_eur"] = (
-        profile_insights["best_supplier_cost_eur"] - profile_insights["best_market_cost_eur"]
+    profile_benchmark["switching_saving_eur"] = (
+        profile_benchmark["worst_supplier_cost_eur"] - profile_benchmark["best_supplier_cost_eur"]
     )
-    profile_insights["switching_saving_pct_of_cheapest"] = 100 * (
-        profile_insights["switching_saving_eur"] / profile_insights["cheapest_supplier_cost_eur"]
+    profile_benchmark["retail_premium_vs_benchmark_eur"] = (
+        profile_benchmark["best_supplier_cost_eur"] - profile_benchmark["best_benchmark_cost_eur"]
+    )
+    profile_benchmark["best_option"] = np.where(
+        profile_benchmark["best_supplier_cost_eur"] <= profile_benchmark["best_benchmark_cost_eur"],
+        "Supplier Tariff",
+        "Benchmark Reference",
     )
 
-    # Monthly market table
-    monthly_dam = dam.groupby("month", as_index=False)["price_eur_mwh"].mean().rename(columns={"price_eur_mwh": "avg_dam_price_eur_mwh"})
-    monthly_settlement = settlement.groupby("month", as_index=False).agg(
-        avg_settlement_price_eur_mwh=("settlement_price", "mean"),
-        avg_predicted_settlement_price_eur_mwh=("predicted_settlement_price", "mean"),
+    provider_heatmap = (
+        supplier_only.groupby(["profile_name", "provider_name"], as_index=False)["annual_total_cost_eur"]
+        .min()
+        .pivot(index="profile_name", columns="provider_name", values="annual_total_cost_eur")
     )
-    monthly_market = monthly_dam.merge(monthly_settlement, on="month", how="outer").sort_values("month")
 
-    # Long market trend sample for faster plotting
-    dam_plot = dam[["timestamp", "price_eur_mwh"]].dropna().rename(columns={"price_eur_mwh": "price"})
-    dam_plot["series"] = "DAM"
-    settlement_plot = settlement[["timestamp", "settlement_price"]].dropna().rename(columns={"settlement_price": "price"})
-    settlement_plot["series"] = "Settlement"
-    market_plot = pd.concat([dam_plot, settlement_plot], ignore_index=True).sort_values("timestamp")
-
-    # Heatmap data
-    heatmap_df = provider_profile_cost.pivot(index="profile_name", columns="provider_name", values="annual_total_cost_eur")
+    benchmark_compare_long = profile_benchmark[[
+        "profile_name", "best_supplier_cost_eur", "best_benchmark_cost_eur"
+    ]].melt(
+        id_vars="profile_name",
+        var_name="type",
+        value_name="annual_cost_eur"
+    )
+    benchmark_compare_long["type"] = benchmark_compare_long["type"].map({
+        "best_supplier_cost_eur": "Best Supplier Tariff",
+        "best_benchmark_cost_eur": "Best Benchmark",
+    })
 
     return {
         "summary": summary,
-        "supplier_summary": supplier_summary,
-        "market_summary": market_summary,
         "profiles": profiles,
-        "profile_insights": profile_insights,
-        "provider_profile_cost": provider_profile_cost,
-        "tariff_spread": tariff_spread,
         "dam": dam,
         "settlement": settlement,
+        "market": market,
         "monthly_market": monthly_market,
-        "market_plot": market_plot,
-        "heatmap_df": heatmap_df,
+        "hourly_market": hourly_market,
+        "weekday_market": weekday_market,
+        "supplier_only": supplier_only,
+        "benchmark_only": benchmark_only,
+        "profile_benchmark": profile_benchmark,
+        "provider_heatmap": provider_heatmap,
+        "benchmark_compare_long": benchmark_compare_long,
     }
 
 
+# -----------------------------
+# Sidebar filters
+# -----------------------------
+def apply_filters(data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    pb = data["profile_benchmark"].copy()
 
-def build_overview_metrics(profile_insights: pd.DataFrame, dam: pd.DataFrame, settlement: pd.DataFrame, supplier_summary: pd.DataFrame) -> Dict[str, object]:
-    avg_dam = dam["price_eur_mwh"].mean()
-    avg_settlement = settlement["settlement_price"].mean()
-    settlement_vol_ratio = safe_div(settlement["settlement_price"].std(), dam["price_eur_mwh"].std())
+    st.sidebar.header("Filter Panel")
 
-    cheapest_row = profile_insights.loc[profile_insights["best_supplier_cost_eur"].idxmin()]
-    highest_use_row = profile_insights.loc[profile_insights["annual_total_kwh"].idxmax()]
-    biggest_switch_row = profile_insights.loc[profile_insights["switching_saving_eur"].idxmax()]
+    profiles = sorted(pb["profile_name"].dropna().unique().tolist())
+    building_types = sorted(pb["building_type"].dropna().unique().tolist()) if "building_type" in pb.columns else []
+    heating_types = sorted(pb["heating_system"].dropna().unique().tolist()) if "heating_system" in pb.columns else []
+    ev_counts = sorted(pb["how_many_evs"].dropna().astype(int).unique().tolist()) if "how_many_evs" in pb.columns else []
+    occupant_counts = sorted(pb["occupants"].dropna().astype(int).unique().tolist()) if "occupants" in pb.columns else []
 
-    supplier_wins = (
-        profile_insights["best_supplier"].dropna().value_counts().rename_axis("provider_name").reset_index(name="wins")
+    selected_profiles = st.sidebar.multiselect("Household profile", profiles, default=profiles)
+    selected_building = st.sidebar.multiselect("Building type", building_types, default=building_types)
+    selected_heating = st.sidebar.multiselect("Heating system", heating_types, default=heating_types)
+    selected_evs = st.sidebar.multiselect("EV count", ev_counts, default=ev_counts)
+    selected_occupants = st.sidebar.multiselect("Occupants", occupant_counts, default=occupant_counts)
+
+    months = sorted(data["monthly_market"]["month"].dropna().unique().tolist())
+    selected_months = st.sidebar.multiselect("Market months", months, default=months)
+
+    spread_focus = st.sidebar.selectbox(
+        "Spread focus",
+        ["All", "Settlement above DAM", "Settlement below DAM"],
+        index=0,
     )
-    top_winner = supplier_wins.iloc[0]["provider_name"] if not supplier_wins.empty else "-"
 
-    negative_dam_pct = 100 * dam["price_eur_mwh"].lt(0).mean()
-    negative_settlement_pct = 100 * settlement["settlement_price"].lt(0).mean()
-
-    return {
-        "avg_dam": avg_dam,
-        "avg_settlement": avg_settlement,
-        "settlement_vol_ratio": settlement_vol_ratio,
-        "cheapest_row": cheapest_row,
-        "highest_use_row": highest_use_row,
-        "biggest_switch_row": biggest_switch_row,
-        "top_winner": top_winner,
-        "negative_dam_pct": negative_dam_pct,
-        "negative_settlement_pct": negative_settlement_pct,
-        "supplier_option_count": supplier_summary["tariff_option_name"].nunique(),
-    }
-
-
-
-def make_download_file(df: pd.DataFrame) -> bytes:
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="dashboard_summary")
-    buffer.seek(0)
-    return buffer.getvalue()
-
-
-
-def add_sidebar_filters(profile_insights: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, object]]:
-    st.sidebar.header("Filters")
-
-    profile_options = sorted(profile_insights["profile_name"].dropna().unique().tolist())
-    building_options = sorted(profile_insights["building_type"].dropna().unique().tolist())
-    heating_options = sorted(profile_insights["heating_system"].dropna().unique().tolist())
-    ev_options = sorted(profile_insights["how_many_evs"].dropna().astype(int).unique().tolist())
-
-    selected_profiles = st.sidebar.multiselect("Household profiles", profile_options, default=profile_options)
-    selected_buildings = st.sidebar.multiselect("Building type", building_options, default=building_options)
-    selected_heating = st.sidebar.multiselect("Heating system", heating_options, default=heating_options)
-    selected_evs = st.sidebar.multiselect("EV count", ev_options, default=ev_options)
-
-    filtered = profile_insights[
-        profile_insights["profile_name"].isin(selected_profiles)
-        & profile_insights["building_type"].isin(selected_buildings)
-        & profile_insights["heating_system"].isin(selected_heating)
-        & profile_insights["how_many_evs"].fillna(0).astype(int).isin(selected_evs)
+    filtered_pb = pb[
+        pb["profile_name"].isin(selected_profiles)
+        & pb["building_type"].isin(selected_building)
+        & pb["heating_system"].isin(selected_heating)
+        & pb["how_many_evs"].fillna(0).astype(int).isin(selected_evs)
+        & pb["occupants"].fillna(0).astype(int).isin(selected_occupants)
     ].copy()
 
-    filters = {
-        "profiles": selected_profiles,
-        "buildings": selected_buildings,
-        "heating": selected_heating,
-        "evs": selected_evs,
+    market = data["market"].copy()
+    market = market[market["month"].isin(selected_months)]
+    if spread_focus == "Settlement above DAM":
+        market = market[market["spread_settlement_minus_dam"] > 0]
+    elif spread_focus == "Settlement below DAM":
+        market = market[market["spread_settlement_minus_dam"] < 0]
+
+    filtered_monthly = data["monthly_market"][data["monthly_market"]["month"].isin(selected_months)].copy()
+    filtered_hourly = data["hourly_market"].copy()
+    filtered_weekday = data["weekday_market"].copy()
+
+    profile_names = filtered_pb["profile_name"].tolist()
+    filtered_supplier_only = data["supplier_only"][data["supplier_only"]["profile_name"].isin(profile_names)].copy()
+    filtered_benchmark_only = data["benchmark_only"][data["benchmark_only"]["profile_name"].isin(profile_names)].copy()
+    filtered_benchmark_compare = data["benchmark_compare_long"][data["benchmark_compare_long"]["profile_name"].isin(profile_names)].copy()
+    filtered_heatmap = data["provider_heatmap"].loc[data["provider_heatmap"].index.intersection(profile_names)] if profile_names else data["provider_heatmap"].iloc[0:0]
+
+    return {
+        "profile_benchmark": filtered_pb,
+        "market": market,
+        "monthly_market": filtered_monthly,
+        "hourly_market": filtered_hourly,
+        "weekday_market": filtered_weekday,
+        "supplier_only": filtered_supplier_only,
+        "benchmark_only": filtered_benchmark_only,
+        "benchmark_compare_long": filtered_benchmark_compare,
+        "provider_heatmap": filtered_heatmap,
+        "spread_focus": spread_focus,
     }
-    return filtered, filters
 
 
+# -----------------------------
+# KPI metrics
+# -----------------------------
+def build_metrics(filtered: Dict[str, pd.DataFrame]) -> Dict[str, object]:
+    pb = filtered["profile_benchmark"]
+    market = filtered["market"]
+    supplier_only = filtered["supplier_only"]
 
-def display_overview_tab(filtered_profiles: pd.DataFrame, metrics: Dict[str, object], monthly_market: pd.DataFrame, heatmap_df: pd.DataFrame):
-    st.subheader("Executive Overview")
+    best_profile = pb.loc[pb["best_supplier_cost_eur"].idxmin()] if not pb.empty else None
+    highest_saving_profile = pb.loc[pb["switching_saving_eur"].idxmax()] if not pb.empty else None
+    highest_premium_profile = pb.loc[pb["retail_premium_vs_benchmark_eur"].idxmax()] if not pb.empty else None
+
+    top_provider = (
+        pb["best_supplier"].value_counts().idxmax() if not pb.empty and pb["best_supplier"].notna().any() else "-"
+    )
+
+    dam_better_pct = 100 * (market["better_market"].eq("DAM").mean()) if not market.empty else np.nan
+    settlement_better_pct = 100 * (market["better_market"].eq("Settlement").mean()) if not market.empty else np.nan
+    corr = market[["settlement_price", "price_eur_mwh"]].corr().iloc[0, 1] if len(market) > 1 else np.nan
+    mae = safe_mean_abs_error(market["settlement_price"], market["predicted_settlement_price"]) if not market.empty else np.nan
+
+    return {
+        "avg_dam": market["price_eur_mwh"].mean() if not market.empty else np.nan,
+        "avg_settlement": market["settlement_price"].mean() if not market.empty else np.nan,
+        "avg_spread": market["spread_settlement_minus_dam"].mean() if not market.empty else np.nan,
+        "avg_abs_spread": market["spread_abs"].mean() if not market.empty else np.nan,
+        "corr_dam_settlement": corr,
+        "pred_mae": mae,
+        "dam_better_pct": dam_better_pct,
+        "settlement_better_pct": settlement_better_pct,
+        "top_provider": top_provider,
+        "best_profile": best_profile,
+        "highest_saving_profile": highest_saving_profile,
+        "highest_premium_profile": highest_premium_profile,
+        "tariff_count": supplier_only["tariff_option_name"].nunique() if not supplier_only.empty else 0,
+    }
+
+
+# -----------------------------
+# Sections
+# -----------------------------
+def overview_section(filtered: Dict[str, pd.DataFrame], metrics: Dict[str, object]) -> None:
+    st.subheader("1. DAM vs Settlement Price Comparison")
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Avg DAM Price", eur(metrics["avg_dam"], 1) + "/MWh")
-    c2.metric("Avg Settlement Price", eur(metrics["avg_settlement"], 1) + "/MWh")
-    c3.metric("Settlement Volatility vs DAM", f"{num(metrics['settlement_vol_ratio'], 1)}x")
-    c4.metric("Top Cheapest Supplier", metrics["top_winner"])
-    c5.metric("Profiles in View", f"{filtered_profiles['profile_name'].nunique()}")
+    c1.metric("Avg DAM", eur(metrics["avg_dam"], 1) + "/MWh")
+    c2.metric("Avg Settlement", eur(metrics["avg_settlement"], 1) + "/MWh")
+    c3.metric("Avg Spread", eur(metrics["avg_spread"], 1) + "/MWh")
+    c4.metric("Avg Absolute Spread", eur(metrics["avg_abs_spread"], 1) + "/MWh")
+    c5.metric("Best Market More Often", "DAM" if (metrics["dam_better_pct"] or 0) >= (metrics["settlement_better_pct"] or 0) else "Settlement")
 
-    left, right = st.columns([1.1, 1])
+    monthly = filtered["monthly_market"]
+    market = filtered["market"]
 
+    left, right = st.columns([1.25, 1])
     with left:
-        market_long = monthly_market.melt(
+        monthly_long = monthly.melt(
             id_vars="month",
-            value_vars=["avg_dam_price_eur_mwh", "avg_settlement_price_eur_mwh"],
+            value_vars=["avg_dam", "avg_settlement", "avg_predicted_settlement"],
             var_name="series",
-            value_name="avg_price_eur_mwh",
+            value_name="price",
         )
-        market_long["series"] = market_long["series"].map({
-            "avg_dam_price_eur_mwh": "DAM",
-            "avg_settlement_price_eur_mwh": "Settlement",
+        monthly_long["series"] = monthly_long["series"].map({
+            "avg_dam": "DAM",
+            "avg_settlement": "Settlement",
+            "avg_predicted_settlement": "Predicted Settlement",
         })
         fig = px.line(
-            market_long,
+            monthly_long,
             x="month",
-            y="avg_price_eur_mwh",
+            y="price",
             color="series",
             markers=True,
-            title="Monthly Average Market Price Trend",
+            title="Monthly DAM vs Settlement Trend",
         )
-        fig.update_layout(height=430, xaxis_title="Month", yaxis_title="€/MWh", legend_title="Series")
+        fig.update_layout(height=430, xaxis_title="Month", yaxis_title="€/MWh")
         st.plotly_chart(fig, use_container_width=True)
 
     with right:
-        if filtered_profiles.empty:
-            st.info("No profiles match the current filters.")
-        else:
-            display_heatmap = heatmap_df.loc[heatmap_df.index.intersection(filtered_profiles["profile_name"])]
-            if not display_heatmap.empty:
-                fig_heat = px.imshow(
-                    display_heatmap,
-                    text_auto=".0f",
-                    aspect="auto",
-                    color_continuous_scale="RdYlGn_r",
-                    title="Supplier Cost Heatmap by Household Profile",
-                )
-                fig_heat.update_layout(height=430, coloraxis_colorbar_title="€/year")
-                st.plotly_chart(fig_heat, use_container_width=True)
+        hourly = filtered["hourly_market"]
+        fig_hour = px.bar(
+            hourly,
+            x="hour",
+            y="avg_spread",
+            title="Average Settlement - DAM Spread by Hour",
+            labels={"hour": "Hour of Day", "avg_spread": "Spread (€/MWh)"},
+        )
+        fig_hour.update_layout(height=430)
+        st.plotly_chart(fig_hour, use_container_width=True)
 
+    if not market.empty:
+        compare_choice = pd.DataFrame({
+            "Market Option": ["DAM cheaper", "Settlement cheaper"],
+            "Share %": [metrics["dam_better_pct"], metrics["settlement_better_pct"]],
+        })
+        fig_choice = px.bar(
+            compare_choice,
+            x="Market Option",
+            y="Share %",
+            title="Which Market Is Lower More Often?",
+            text="Share %",
+        )
+        fig_choice.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+        fig_choice.update_layout(height=360)
+        st.plotly_chart(fig_choice, use_container_width=True)
+
+    recommendation = "DAM" if (metrics["dam_better_pct"] or 0) > (metrics["settlement_better_pct"] or 0) else "Settlement"
     st.markdown('<div class="insight-box">', unsafe_allow_html=True)
     st.markdown(
         f"""
-**What stands out**
+**Business readout**
 
-- The cheapest supplier across the current view is **{metrics['top_winner']}**.
-- Settlement prices are about **{num(metrics['settlement_vol_ratio'], 1)}x** as volatile as DAM on this dataset.
-- Negative pricing appears more often in Settlement (**{pct(metrics['negative_settlement_pct'])}**) than DAM (**{pct(metrics['negative_dam_pct'])}**).
-- The highest-usage household profile is **{metrics['highest_use_row']['profile_name']}** at **{num(metrics['highest_use_row']['annual_total_kwh'], 0)} kWh/year**.
+- On the selected market window, **{recommendation}** is the lower-priced option more often.
+- Average DAM price is **{eur(metrics['avg_dam'], 1)}/MWh**, while average Settlement is **{eur(metrics['avg_settlement'], 1)}/MWh**.
+- The average absolute spread is **{eur(metrics['avg_abs_spread'], 1)}/MWh**, which shows how far balancing outcomes move away from the day-ahead signal.
+- This helps answer: **Should we rely more on DAM or Settlement as the benchmark when judging tariffs?**
         """
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
 
 
-def display_profile_tab(filtered_profiles: pd.DataFrame):
-    st.subheader("Household Profile Explorer")
-    if filtered_profiles.empty:
-        st.warning("No profile data available for the selected filters.")
+def tariff_section(filtered: Dict[str, pd.DataFrame], metrics: Dict[str, object]) -> None:
+    st.subheader("2. Best Tariff Options to Choose")
+    pb = filtered["profile_benchmark"]
+    supplier_only = filtered["supplier_only"]
+
+    if pb.empty:
+        st.warning("No household profiles match the current filters.")
         return
 
-    breakdown_long = filtered_profiles[[
-        "profile_name", "annual_appliances_kwh", "annual_heating_kwh", "annual_ev_kwh"
-    ]].melt(
-        id_vars="profile_name",
-        var_name="load_type",
-        value_name="annual_kwh"
-    )
-    breakdown_long["load_type"] = breakdown_long["load_type"].map({
-        "annual_appliances_kwh": "Appliances",
-        "annual_heating_kwh": "Heating",
-        "annual_ev_kwh": "EV Charging",
-    })
-
-    left, right = st.columns(2)
-    with left:
-        fig_total = px.bar(
-            filtered_profiles.sort_values("annual_total_kwh", ascending=True),
-            x="annual_total_kwh",
-            y="profile_name",
-            orientation="h",
-            color="heating_system",
-            title="Annual Electricity Usage by Household Profile",
-            labels={"annual_total_kwh": "Annual kWh", "profile_name": "Profile"},
-        )
-        fig_total.update_layout(height=450)
-        st.plotly_chart(fig_total, use_container_width=True)
-
-    with right:
-        fig_breakdown = px.bar(
-            breakdown_long,
-            x="annual_kwh",
-            y="profile_name",
-            color="load_type",
-            orientation="h",
-            barmode="stack",
-            title="Consumption Breakdown: Appliances vs Heating vs EV",
-            labels={"annual_kwh": "Annual kWh", "profile_name": "Profile", "load_type": "Load Type"},
-        )
-        fig_breakdown.update_layout(height=450)
-        st.plotly_chart(fig_breakdown, use_container_width=True)
-
-    focus_profile = st.selectbox("Select a profile for detailed interpretation", filtered_profiles["profile_name"].tolist())
-    p = filtered_profiles.loc[filtered_profiles["profile_name"].eq(focus_profile)].iloc[0]
-
-    st.markdown('<div class="insight-box">', unsafe_allow_html=True)
-    st.markdown(
-        f"""
-**Profile interpretation: {focus_profile}**
-
-- Building type: **{p['building_type']}**
-- Heating system: **{p['heating_system']}**
-- EV count: **{int(p['how_many_evs'])}**
-- Total annual demand: **{num(p['annual_total_kwh'], 0)} kWh**
-- Dominant load driver: **{p['dominant_load']}**
-- Appliances share: **{pct(p['appliances_share_pct'])}**
-- Heating share: **{pct(p['heating_share_pct'])}**
-- EV share: **{pct(p['ev_share_pct'])}**
-        """
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
-
-def display_tariff_tab(filtered_profiles: pd.DataFrame, provider_profile_cost: pd.DataFrame, supplier_summary: pd.DataFrame):
-    st.subheader("Tariff Comparison")
-    if filtered_profiles.empty:
-        st.warning("No tariff data available for the selected filters.")
-        return
-
-    available_profiles = filtered_profiles["profile_name"].tolist()
-    selected_profile = st.selectbox("Choose a household profile", available_profiles, key="tariff_profile")
-
-    profile_provider = provider_profile_cost[provider_profile_cost["profile_name"].eq(selected_profile)].sort_values("annual_total_cost_eur")
-    profile_ranked = supplier_summary[supplier_summary["profile_name"].eq(selected_profile)].sort_values("annual_total_cost_eur")
-    profile_row = filtered_profiles[filtered_profiles["profile_name"].eq(selected_profile)].iloc[0]
+    selected_profile = st.selectbox("Choose a household profile", pb["profile_name"].tolist())
+    profile_table = supplier_only[supplier_only["profile_name"].eq(selected_profile)].sort_values("annual_total_cost_eur")
+    profile_summary = pb[pb["profile_name"].eq(selected_profile)].iloc[0]
 
     left, right = st.columns([1.2, 1])
     with left:
         fig_provider = px.bar(
-            profile_provider,
+            profile_table,
             x="provider_name",
             y="annual_total_cost_eur",
             color="provider_name",
-            title="Annual Cost by Provider for Selected Profile",
+            hover_data=["tariff_option_name", "difference_vs_dam_10pct_eur", "difference_vs_settlement_10pct_eur"],
+            title="Provider Cost Ranking for Selected Profile",
             labels={"annual_total_cost_eur": "Annual Cost (€)", "provider_name": "Provider"},
         )
         fig_provider.update_layout(height=430, showlegend=False)
         st.plotly_chart(fig_provider, use_container_width=True)
 
     with right:
-        comparison_df = pd.DataFrame({
-            "Measure": ["Cheapest Supplier", "Average Supplier", "Most Expensive Supplier"],
+        comp = pd.DataFrame({
+            "Measure": ["Best Supplier", "Worst Supplier", "Benchmark"],
             "Annual Cost (€)": [
-                profile_row["cheapest_supplier_cost_eur"],
-                profile_row["avg_supplier_cost_eur"],
-                profile_row["most_expensive_supplier_cost_eur"],
+                profile_summary["best_supplier_cost_eur"],
+                profile_summary["worst_supplier_cost_eur"],
+                profile_summary["best_benchmark_cost_eur"],
             ]
         })
-        fig_spread = px.bar(
-            comparison_df,
+        fig_comp = px.bar(
+            comp,
             x="Measure",
             y="Annual Cost (€)",
             color="Measure",
-            title="Supplier Cost Spread",
+            title="Best Supplier vs Worst Supplier vs Benchmark",
         )
-        fig_spread.update_layout(height=430, showlegend=False)
-        st.plotly_chart(fig_spread, use_container_width=True)
+        fig_comp.update_layout(height=430, showlegend=False)
+        st.plotly_chart(fig_comp, use_container_width=True)
 
     st.markdown('<div class="insight-box">', unsafe_allow_html=True)
     st.markdown(
         f"""
-**Tariff insight for this profile**
+**Tariff recommendation for {selected_profile}**
 
-- Best supplier: **{profile_row['best_supplier']}**
-- Best tariff option: **{profile_row['best_tariff']}**
-- Best supplier annual cost: **{eur(profile_row['best_supplier_cost_eur'])}**
-- Best market benchmark cost: **{eur(profile_row['best_market_cost_eur'])}**
-- Retail premium vs best market benchmark: **{eur(profile_row['retail_premium_vs_market_eur'])}**
-- Potential switching saving inside supplier tariffs: **{eur(profile_row['switching_saving_eur'])}**
+- Recommended supplier: **{profile_summary['best_supplier']}**
+- Recommended tariff option: **{profile_summary['best_supplier_tariff']}**
+- Best supplier cost: **{eur(profile_summary['best_supplier_cost_eur'])}**
+- Worst supplier cost: **{eur(profile_summary['worst_supplier_cost_eur'])}**
+- Switching opportunity: **{eur(profile_summary['switching_saving_eur'])}**
+- Versus DAM benchmark: **{eur(profile_summary['best_vs_dam_eur'])}**
+- Versus Settlement benchmark: **{eur(profile_summary['best_vs_settlement_eur'])}**
         """
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("#### Ranked tariff options")
-    ranked_display = profile_ranked[[
-        "rank", "provider_name", "tariff_option_name", "category", "annual_total_cost_eur",
-        "difference_vs_dam_10pct_eur", "difference_vs_settlement_10pct_eur", "cheaper_than_market"
-    ]].copy()
-    ranked_display = ranked_display.rename(columns={
-        "provider_name": "Provider",
-        "tariff_option_name": "Tariff Option",
-        "category": "Category",
-        "annual_total_cost_eur": "Annual Cost (€)",
-        "difference_vs_dam_10pct_eur": "Diff vs DAM 10% (€)",
-        "difference_vs_settlement_10pct_eur": "Diff vs Settlement 10% (€)",
-        "cheaper_than_market": "Cheaper Than Market",
-        "rank": "Rank",
-    })
-    st.dataframe(ranked_display, use_container_width=True, hide_index=True)
-
-
-
-def display_market_tab(dam: pd.DataFrame, settlement: pd.DataFrame, monthly_market: pd.DataFrame):
-    st.subheader("Market Benchmark")
-
-    sample_rate = st.select_slider("Trend detail", options=["Full", "Half", "Quarter"], value="Quarter")
-    step_map = {"Full": 1, "Half": 2, "Quarter": 4}
-    step = step_map[sample_rate]
-
-    dam_sample = dam[["timestamp", "price_eur_mwh"]].dropna().iloc[::step].copy()
-    dam_sample["series"] = "DAM"
-    dam_sample = dam_sample.rename(columns={"price_eur_mwh": "price"})
-
-    settlement_sample = settlement[["timestamp", "settlement_price"]].dropna().iloc[::step].copy()
-    settlement_sample["series"] = "Settlement"
-    settlement_sample = settlement_sample.rename(columns={"settlement_price": "price"})
-
-    trend_df = pd.concat([dam_sample, settlement_sample], ignore_index=True).sort_values("timestamp")
-
-    left, right = st.columns(2)
-    with left:
-        fig_trend = px.line(
-            trend_df,
-            x="timestamp",
-            y="price",
-            color="series",
-            title="DAM vs Settlement Price Trend",
-            labels={"timestamp": "Timestamp", "price": "€/MWh", "series": "Series"},
-        )
-        fig_trend.update_layout(height=430)
-        st.plotly_chart(fig_trend, use_container_width=True)
-
-    with right:
-        settlement_compare = settlement[["timestamp", "settlement_price", "predicted_settlement_price"]].dropna().copy()
-        settlement_compare = settlement_compare.iloc[::step]
-        long_compare = settlement_compare.melt(
-            id_vars="timestamp",
-            value_vars=["settlement_price", "predicted_settlement_price"],
-            var_name="series",
-            value_name="price",
-        )
-        long_compare["series"] = long_compare["series"].map({
-            "settlement_price": "Actual Settlement",
-            "predicted_settlement_price": "Predicted Settlement",
-        })
-        fig_pred = px.line(
-            long_compare,
-            x="timestamp",
-            y="price",
-            color="series",
-            title="Actual vs Predicted Settlement Price",
-            labels={"timestamp": "Timestamp", "price": "€/MWh", "series": "Series"},
-        )
-        fig_pred.update_layout(height=430)
-        st.plotly_chart(fig_pred, use_container_width=True)
-
-    monthly_long = monthly_market.melt(
-        id_vars="month",
-        value_vars=[
-            "avg_dam_price_eur_mwh",
-            "avg_settlement_price_eur_mwh",
-            "avg_predicted_settlement_price_eur_mwh",
-        ],
-        var_name="series",
-        value_name="avg_price",
-    )
-    monthly_long["series"] = monthly_long["series"].map({
-        "avg_dam_price_eur_mwh": "DAM",
-        "avg_settlement_price_eur_mwh": "Settlement",
-        "avg_predicted_settlement_price_eur_mwh": "Predicted Settlement",
-    })
-    fig_monthly = px.bar(
-        monthly_long,
-        x="month",
-        y="avg_price",
-        color="series",
-        barmode="group",
-        title="Monthly Average Market Prices",
-        labels={"month": "Month", "avg_price": "€/MWh", "series": "Series"},
-    )
-    fig_monthly.update_layout(height=420)
-    st.plotly_chart(fig_monthly, use_container_width=True)
-
-    corr = settlement[["settlement_price", "predicted_settlement_price"]].dropna().corr().iloc[0, 1]
-    mae = np.mean(np.abs(
-        settlement["settlement_price"].dropna().values[:len(settlement["predicted_settlement_price"].dropna())]
-        - settlement["predicted_settlement_price"].dropna().values[:len(settlement["settlement_price"].dropna())]
-    ))
-
-    st.markdown('<div class="insight-box">', unsafe_allow_html=True)
-    st.markdown(
-        f"""
-**Market interpretation**
-
-- DAM provides the wholesale baseline, while Settlement shows balancing outcomes after deviations from expected positions.
-- The correlation between actual and predicted settlement prices is **{num(corr, 2)}**, which helps you discuss forecast tracking quality.
-- The mean absolute error between actual and predicted settlement prices is about **{eur(mae, 1)}/MWh**.
-        """
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
-
-def display_recommendation_tab(filtered_profiles: pd.DataFrame):
-    st.subheader("Decision Summary & Export")
-    if filtered_profiles.empty:
-        st.warning("No records available for export.")
-        return
-
-    summary_table = filtered_profiles[[
-        "profile_name", "building_type", "occupants", "heating_system", "how_many_evs",
-        "annual_total_kwh", "dominant_load", "best_supplier", "best_tariff",
-        "best_supplier_cost_eur", "best_market_reference", "best_market_option",
-        "best_market_cost_eur", "retail_premium_vs_market_eur", "switching_saving_eur"
-    ]].copy().sort_values("annual_total_kwh", ascending=False)
-
-    summary_table = summary_table.rename(columns={
+    winner_table = pb[[
+        "profile_name", "building_type", "heating_system", "how_many_evs", "annual_total_kwh",
+        "best_supplier", "best_supplier_tariff", "best_supplier_cost_eur",
+        "switching_saving_eur", "best_option"
+    ]].copy().sort_values("best_supplier_cost_eur")
+    winner_table = winner_table.rename(columns={
         "profile_name": "Profile",
         "building_type": "Building Type",
-        "occupants": "Occupants",
-        "heating_system": "Heating System",
-        "how_many_evs": "EV Count",
+        "heating_system": "Heating",
+        "how_many_evs": "EVs",
         "annual_total_kwh": "Annual kWh",
-        "dominant_load": "Dominant Load",
         "best_supplier": "Best Supplier",
-        "best_tariff": "Best Tariff",
+        "best_supplier_tariff": "Best Tariff",
         "best_supplier_cost_eur": "Best Supplier Cost (€)",
-        "best_market_reference": "Best Market Reference",
-        "best_market_option": "Best Market Option",
-        "best_market_cost_eur": "Best Market Cost (€)",
-        "retail_premium_vs_market_eur": "Retail Premium vs Market (€)",
         "switching_saving_eur": "Switching Saving (€)",
+        "best_option": "Cheapest Overall Option",
+    })
+    st.dataframe(winner_table, use_container_width=True, hide_index=True)
+
+
+
+def benchmark_section(filtered: Dict[str, pd.DataFrame], metrics: Dict[str, object]) -> None:
+    st.subheader("3. Benchmark Comparisons")
+    pb = filtered["profile_benchmark"]
+    if pb.empty:
+        st.warning("No benchmark rows available for the selected filters.")
+        return
+
+    left, right = st.columns([1.15, 1])
+    with left:
+        fig_bench = px.bar(
+            filtered["benchmark_compare_long"],
+            x="profile_name",
+            y="annual_cost_eur",
+            color="type",
+            barmode="group",
+            title="Best Supplier Tariff vs Best Benchmark by Profile",
+            labels={"profile_name": "Profile", "annual_cost_eur": "Annual Cost (€)", "type": "Option"},
+        )
+        fig_bench.update_layout(height=430)
+        st.plotly_chart(fig_bench, use_container_width=True)
+
+    with right:
+        fig_gap = px.bar(
+            pb.sort_values("retail_premium_vs_benchmark_eur", ascending=True),
+            x="retail_premium_vs_benchmark_eur",
+            y="profile_name",
+            orientation="h",
+            color="best_option",
+            title="Retail Premium vs Best Benchmark",
+            labels={"retail_premium_vs_benchmark_eur": "Premium (€)", "profile_name": "Profile", "best_option": "Cheapest Option"},
+        )
+        fig_gap.update_layout(height=430)
+        st.plotly_chart(fig_gap, use_container_width=True)
+
+    heatmap = filtered["provider_heatmap"]
+    if not heatmap.empty:
+        fig_heat = px.imshow(
+            heatmap,
+            text_auto=".0f",
+            aspect="auto",
+            color_continuous_scale="RdYlGn_r",
+            title="Supplier Benchmark Heatmap by Profile",
+        )
+        fig_heat.update_layout(height=420, coloraxis_colorbar_title="€/year")
+        st.plotly_chart(fig_heat, use_container_width=True)
+
+    top_gap = pb.loc[pb["retail_premium_vs_benchmark_eur"].idxmax()]
+    st.markdown('<div class="insight-box">', unsafe_allow_html=True)
+    st.markdown(
+        f"""
+**Benchmark insight**
+
+- The profile with the highest gap versus benchmark is **{top_gap['profile_name']}**.
+- Its best supplier cost is **{eur(top_gap['best_supplier_cost_eur'])}**, versus a best benchmark of **{eur(top_gap['best_benchmark_cost_eur'])}**.
+- This premium of **{eur(top_gap['retail_premium_vs_benchmark_eur'])}** highlights where the strongest pricing pressure or negotiation opportunity sits.
+- This section helps answer: **Are supplier tariffs competitive enough relative to market-based references?**
+        """
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+
+def solution_section(filtered: Dict[str, pd.DataFrame], metrics: Dict[str, object]) -> None:
+    st.subheader("4. Business Problems, Insights, and Recommended Actions")
+    pb = filtered["profile_benchmark"]
+    market = filtered["market"]
+
+    if pb.empty:
+        st.warning("No profiles available for recommendation output.")
+        return
+
+    highest_saving = pb.loc[pb["switching_saving_eur"].idxmax()]
+    highest_usage = pb.loc[pb["annual_total_kwh"].idxmax()]
+    most_evs = pb.sort_values("how_many_evs", ascending=False).iloc[0]
+
+    st.markdown('<div class="insight-box">', unsafe_allow_html=True)
+    st.markdown(
+        f"""
+**Relevant business problems this dashboard can answer**
+
+1. **Which market reference should we trust more for pricing comparison?**  
+   Use the DAM vs Settlement section. In the current view, DAM is cheaper **{pct(metrics['dam_better_pct'])}** of the time and Settlement is cheaper **{pct(metrics['settlement_better_pct'])}** of the time.
+
+2. **Which household profile has the highest switching opportunity?**  
+   **{highest_saving['profile_name']}** with a potential saving of **{eur(highest_saving['switching_saving_eur'])}**.
+
+3. **Which households should be prioritized for tariff optimization?**  
+   High-usage households like **{highest_usage['profile_name']}** at **{num(highest_usage['annual_total_kwh'], 0)} kWh/year**.
+
+4. **Where do EV households create a case for smarter pricing?**  
+   Profiles like **{most_evs['profile_name']}** can be used to test time-based pricing strategies and off-peak charging recommendations.
+        """
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    recommendations = pb[[
+        "profile_name", "building_type", "heating_system", "how_many_evs", "occupants",
+        "annual_total_kwh", "best_supplier", "best_supplier_tariff", "best_supplier_cost_eur",
+        "best_benchmark_option", "best_benchmark_cost_eur", "retail_premium_vs_benchmark_eur",
+        "switching_saving_eur", "best_option"
+    ]].copy().sort_values(["switching_saving_eur", "annual_total_kwh"], ascending=[False, False])
+
+    recommendations = recommendations.rename(columns={
+        "profile_name": "Profile",
+        "building_type": "Building Type",
+        "heating_system": "Heating",
+        "how_many_evs": "EVs",
+        "occupants": "Occupants",
+        "annual_total_kwh": "Annual kWh",
+        "best_supplier": "Best Supplier",
+        "best_supplier_tariff": "Best Tariff",
+        "best_supplier_cost_eur": "Best Supplier Cost (€)",
+        "best_benchmark_option": "Best Benchmark Option",
+        "best_benchmark_cost_eur": "Best Benchmark Cost (€)",
+        "retail_premium_vs_benchmark_eur": "Premium vs Benchmark (€)",
+        "switching_saving_eur": "Switching Saving (€)",
+        "best_option": "Cheapest Overall Option",
     })
 
-    top_switch = summary_table.loc[summary_table["Switching Saving (€)"].idxmax()]
-    highest_market_gap = summary_table.loc[summary_table["Retail Premium vs Market (€)"].idxmax()]
+    st.dataframe(recommendations, use_container_width=True, hide_index=True)
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown('<div class="insight-box">', unsafe_allow_html=True)
-        st.markdown(
-            f"""
-**Biggest switching opportunity**
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        recommendations.to_excel(writer, sheet_name="strategy_output", index=False)
+    output.seek(0)
 
-- Profile: **{top_switch['Profile']}**
-- Best supplier: **{top_switch['Best Supplier']}**
-- Potential saving vs most expensive supplier: **{eur(top_switch['Switching Saving (€)'])}**
-            """
-        )
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with c2:
-        st.markdown('<div class="insight-box">', unsafe_allow_html=True)
-        st.markdown(
-            f"""
-**Highest premium above market benchmark**
-
-- Profile: **{highest_market_gap['Profile']}**
-- Best supplier cost: **{eur(highest_market_gap['Best Supplier Cost (€)'])}**
-- Best market benchmark: **{eur(highest_market_gap['Best Market Cost (€)'])}**
-- Premium: **{eur(highest_market_gap['Retail Premium vs Market (€)'])}**
-            """
-        )
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    st.dataframe(summary_table, use_container_width=True, hide_index=True)
-
-    export_bytes = make_download_file(summary_table)
     st.download_button(
-        label="Download decision summary",
-        data=export_bytes,
-        file_name="dashboard_decision_summary.xlsx",
+        "Download strategy table",
+        data=output,
+        file_name="market_benchmark_strategy_output.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
 
 # -----------------------------
-# App
+# Main app
 # -----------------------------
-st.title("⚡ Tariff Intelligence Dashboard")
-st.caption("Business-style dashboard for household tariff comparison, market benchmarking, and switching insights.")
+st.title("📈 Market Benchmark & Tariff Strategy Dashboard")
+st.caption("Business-focused dashboard for DAM vs Settlement comparison, tariff selection, and benchmark strategy.")
 
 with st.sidebar:
-    st.markdown("### Upload workbook")
     uploaded_file = st.file_uploader(
-        "Upload the Excel file",
+        "Upload workbook",
         type=["xlsx"],
-        help="The workbook must contain All_Profile_Summary, Profile_Overview, DAM, and Settlement sheets.",
+        help="Workbook must include All_Profile_Summary, Profile_Overview, DAM, and Settlement.",
     )
 
 if uploaded_file is None:
-    st.info("Upload your workbook to generate the dashboard.")
+    st.info("Upload your Excel workbook to generate the dashboard.")
     st.stop()
 
 try:
     data = load_workbook(uploaded_file)
 except Exception as e:
-    st.error(f"Could not read the workbook: {e}")
+    st.error(f"Could not load workbook: {e}")
     st.stop()
 
-profile_insights = data["profile_insights"]
-filtered_profiles, active_filters = add_sidebar_filters(profile_insights)
-filtered_profile_names = filtered_profiles["profile_name"].unique().tolist()
+filtered = apply_filters(data)
+metrics = build_metrics(filtered)
 
-filtered_provider_profile_cost = data["provider_profile_cost"][
-    data["provider_profile_cost"]["profile_name"].isin(filtered_profile_names)
-]
-
-filtered_supplier_summary = data["supplier_summary"][
-    data["supplier_summary"]["profile_name"].isin(filtered_profile_names)
-]
-
-filtered_heatmap = data["heatmap_df"]
-
-if filtered_profile_names:
-    filtered_heatmap = filtered_heatmap.loc[
-        filtered_heatmap.index.intersection(filtered_profile_names)
-    ]
-else:
-    filtered_heatmap = filtered_heatmap.iloc[0:0]
-
-metrics = build_overview_metrics(
-    profile_insights,
-    data["dam"],
-    data["settlement"],
-    data["supplier_summary"]
-)
-
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "Overview",
-    "Profile Explorer",
-    "Tariff Comparison",
-    "Market Benchmark",
-    "Decision Summary",
+section1, section2, section3, section4 = st.tabs([
+    "Market Comparison",
+    "Tariff Selection",
+    "Benchmark Comparison",
+    "Business Solutions",
 ])
 
-with tab1:
-    display_overview_tab(filtered_profiles, metrics, data["monthly_market"], filtered_heatmap)
+with section1:
+    overview_section(filtered, metrics)
 
-with tab2:
-    display_profile_tab(filtered_profiles)
+with section2:
+    tariff_section(filtered, metrics)
 
-with tab3:
-    display_tariff_tab(filtered_profiles, filtered_provider_profile_cost, filtered_supplier_summary)
+with section3:
+    benchmark_section(filtered, metrics)
 
-with tab4:
-    display_market_tab(data["dam"], data["settlement"], data["monthly_market"])
-
-with tab5:
-    display_recommendation_tab(filtered_profiles)
+with section4:
+    solution_section(filtered, metrics)
 
 st.markdown("---")
 st.markdown(
-    '<div class="small-note">Built to work with future workbooks that follow the same sheet names and column structure.</div>',
+    '<div class="small-note">This app is designed for workbooks with the same structure and gives meeting-ready filters, comparisons, and business insights.</div>',
     unsafe_allow_html=True,
 )
