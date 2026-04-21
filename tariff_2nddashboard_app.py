@@ -103,12 +103,15 @@ def prepare_data(data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
         if col in profiles.columns:
             profiles[col] = pd.to_numeric(profiles[col], errors="coerce")
 
+    # DAM sheet: original source is €/MWh, convert only this column to €/kWh for reporting
     dam["timestamp"] = pd.to_datetime(dam["start_time_utc"], errors="coerce", utc=True)
     dam["price_eur_mwh"] = pd.to_numeric(dam["price_eur_mwh"], errors="coerce")
+    dam["price_eur_kwh"] = dam["price_eur_mwh"] / 1000
     dam["month"] = dam["timestamp"].dt.to_period("M").astype(str)
     dam["hour"] = dam["timestamp"].dt.hour
     dam["weekday"] = dam["timestamp"].dt.day_name()
 
+    # Settlement sheet remains unchanged as requested
     settlement["timestamp"] = pd.to_datetime(settlement["timestamp"], errors="coerce", utc=True)
     settlement["settlement_price"] = pd.to_numeric(settlement["settlement_price"], errors="coerce")
     settlement["predicted_settlement_price"] = pd.to_numeric(settlement["predicted_settlement_price"], errors="coerce")
@@ -117,21 +120,21 @@ def prepare_data(data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
     settlement["weekday"] = settlement["timestamp"].dt.day_name()
 
     market = pd.merge(
-        dam[["timestamp", "month", "hour", "weekday", "price_eur_mwh"]],
+        dam[["timestamp", "month", "hour", "weekday", "price_eur_kwh"]],
         settlement[["timestamp", "month", "hour", "weekday", "settlement_price", "predicted_settlement_price"]],
         on=["timestamp", "month", "hour", "weekday"],
         how="inner",
     )
-    market["spread_settlement_minus_dam"] = market["settlement_price"] - market["price_eur_mwh"]
+    market["spread_settlement_minus_dam"] = market["settlement_price"] - market["price_eur_kwh"]
     market["spread_abs"] = market["spread_settlement_minus_dam"].abs()
     market["better_market"] = np.where(
-        market["settlement_price"] < market["price_eur_mwh"],
+        market["settlement_price"] < market["price_eur_kwh"],
         "Settlement",
         "DAM"
     )
 
     monthly_market = market.groupby("month", as_index=False).agg(
-        avg_dam=("price_eur_mwh", "mean"),
+        avg_dam=("price_eur_kwh", "mean"),
         avg_settlement=("settlement_price", "mean"),
         avg_predicted_settlement=("predicted_settlement_price", "mean"),
         avg_spread=("spread_settlement_minus_dam", "mean"),
@@ -139,13 +142,13 @@ def prepare_data(data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
     )
 
     hourly_market = market.groupby("hour", as_index=False).agg(
-        avg_dam=("price_eur_mwh", "mean"),
+        avg_dam=("price_eur_kwh", "mean"),
         avg_settlement=("settlement_price", "mean"),
         avg_spread=("spread_settlement_minus_dam", "mean"),
     )
 
     weekday_market = market.groupby("weekday", as_index=False).agg(
-        avg_dam=("price_eur_mwh", "mean"),
+        avg_dam=("price_eur_kwh", "mean"),
         avg_settlement=("settlement_price", "mean"),
         avg_spread=("spread_settlement_minus_dam", "mean"),
     )
@@ -333,11 +336,11 @@ def build_metrics(filtered: Dict[str, pd.DataFrame]) -> Dict[str, object]:
 
     dam_better_pct = 100 * (market["better_market"].eq("DAM").mean()) if not market.empty else np.nan
     settlement_better_pct = 100 * (market["better_market"].eq("Settlement").mean()) if not market.empty else np.nan
-    corr = market[["settlement_price", "price_eur_mwh"]].corr().iloc[0, 1] if len(market) > 1 else np.nan
+    corr = market[["settlement_price", "price_eur_kwh"]].corr().iloc[0, 1] if len(market) > 1 else np.nan
     mae = safe_mean_abs_error(market["settlement_price"], market["predicted_settlement_price"]) if not market.empty else np.nan
 
     return {
-        "avg_dam": market["price_eur_mwh"].mean() if not market.empty else np.nan,
+        "avg_dam": market["price_eur_kwh"].mean() if not market.empty else np.nan,
         "avg_settlement": market["settlement_price"].mean() if not market.empty else np.nan,
         "avg_spread": market["spread_settlement_minus_dam"].mean() if not market.empty else np.nan,
         "avg_abs_spread": market["spread_abs"].mean() if not market.empty else np.nan,
@@ -359,10 +362,10 @@ def build_metrics(filtered: Dict[str, pd.DataFrame]) -> Dict[str, object]:
 def overview_section(filtered: Dict[str, pd.DataFrame], metrics: Dict[str, object]) -> None:
     st.subheader("1. DAM vs Settlement Price Comparison")
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Avg DAM", eur(metrics["avg_dam"], 1) + "/MWh")
-    c2.metric("Avg Settlement", eur(metrics["avg_settlement"], 1) + "/MWh")
-    c3.metric("Avg Spread", eur(metrics["avg_spread"], 1) + "/MWh")
-    c4.metric("Avg Absolute Spread", eur(metrics["avg_abs_spread"], 1) + "/MWh")
+    c1.metric("Avg DAM", eur(metrics["avg_dam"], 4) + "/kWh")
+    c2.metric("Avg Settlement", eur(metrics["avg_settlement"], 4) + "/kWh")
+    c3.metric("Avg Spread", eur(metrics["avg_spread"], 4) + "/kWh")
+    c4.metric("Avg Absolute Spread", eur(metrics["avg_abs_spread"], 4) + "/kWh")
     c5.metric("Best Market More Often", "DAM" if (metrics["dam_better_pct"] or 0) >= (metrics["settlement_better_pct"] or 0) else "Settlement")
 
     monthly = filtered["monthly_market"]
@@ -389,7 +392,7 @@ def overview_section(filtered: Dict[str, pd.DataFrame], metrics: Dict[str, objec
             markers=True,
             title="Monthly DAM vs Settlement Trend",
         )
-        fig.update_layout(height=430, xaxis_title="Month", yaxis_title="€/MWh")
+        fig.update_layout(height=430, xaxis_title="Month", yaxis_title="€/kWh")
         st.plotly_chart(fig, use_container_width=True)
 
     with right:
@@ -399,7 +402,7 @@ def overview_section(filtered: Dict[str, pd.DataFrame], metrics: Dict[str, objec
             x="hour",
             y="avg_spread",
             title="Average Settlement - DAM Spread by Hour",
-            labels={"hour": "Hour of Day", "avg_spread": "Spread (€/MWh)"},
+            labels={"hour": "Hour of Day", "avg_spread": "Spread (€/kWh)"},
         )
         fig_hour.update_layout(height=430)
         st.plotly_chart(fig_hour, use_container_width=True)
@@ -427,8 +430,8 @@ def overview_section(filtered: Dict[str, pd.DataFrame], metrics: Dict[str, objec
 **Business readout**
 
 - On the selected market window, **{recommendation}** is the lower-priced option more often.
-- Average DAM price is **{eur(metrics['avg_dam'], 1)}/MWh**, while average Settlement is **{eur(metrics['avg_settlement'], 1)}/MWh**.
-- The average absolute spread is **{eur(metrics['avg_abs_spread'], 1)}/MWh**, which shows how far balancing outcomes move away from the day-ahead signal.
+- Average DAM price is **{eur(metrics['avg_dam'], 4)}/kWh**, while average Settlement is **{eur(metrics['avg_settlement'], 4)}/kWh**.
+- The average absolute spread is **{eur(metrics['avg_abs_spread'], 4)}/kWh**, which shows how far balancing outcomes move away from the day-ahead signal.
 - This helps answer: **Should we rely more on DAM or Settlement as the benchmark when judging tariffs?**
         """
     )
