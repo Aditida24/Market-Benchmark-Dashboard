@@ -1,10 +1,9 @@
 import io
-from typing import Dict, List, Optional
+from typing import Dict
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 
 st.set_page_config(
@@ -61,6 +60,17 @@ def safe_mean_abs_error(actual: pd.Series, predicted: pd.Series) -> float:
     return np.mean(np.abs(df.iloc[:, 0] - df.iloc[:, 1]))
 
 
+def get_dam_market_col(df: pd.DataFrame) -> str:
+    """
+    Returns the correct DAM price column from market dataframe.
+    Supports both old and new column names.
+    """
+    for col in ["dam_price", "price_eur_kwh", "price_eur_mwh"]:
+        if col in df.columns:
+            return col
+    raise KeyError(f"No DAM market price column found. Available columns: {list(df.columns)}")
+
+
 @st.cache_data(show_spinner=False)
 def load_workbook(uploaded_file) -> Dict[str, pd.DataFrame]:
     xls = pd.ExcelFile(uploaded_file)
@@ -106,7 +116,7 @@ def prepare_data(data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
     # DAM sheet: convert only this column from €/MWh to €/kWh
     dam["timestamp"] = pd.to_datetime(dam["start_time_utc"], errors="coerce", utc=True)
     dam["price_eur_mwh"] = pd.to_numeric(dam["price_eur_mwh"], errors="coerce")
-    dam["price_eur_kwh"] = dam["price_eur_mwh"] / 1000
+    dam["dam_price"] = dam["price_eur_mwh"] / 1000
     dam["month"] = dam["timestamp"].dt.to_period("M").astype(str)
     dam["hour"] = dam["timestamp"].dt.hour
     dam["weekday"] = dam["timestamp"].dt.day_name()
@@ -120,13 +130,12 @@ def prepare_data(data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
     settlement["weekday"] = settlement["timestamp"].dt.day_name()
 
     market = pd.merge(
-        dam[["timestamp", "month", "hour", "weekday", "price_eur_kwh"]].rename(
-            columns={"price_eur_kwh": "dam_price"}
-        ),
+        dam[["timestamp", "month", "hour", "weekday", "dam_price"]],
         settlement[["timestamp", "month", "hour", "weekday", "settlement_price", "predicted_settlement_price"]],
         on=["timestamp", "month", "hour", "weekday"],
         how="inner",
     )
+
     market["spread_settlement_minus_dam"] = market["settlement_price"] - market["dam_price"]
     market["spread_abs"] = market["spread_settlement_minus_dam"].abs()
     market["better_market"] = np.where(
@@ -336,13 +345,15 @@ def build_metrics(filtered: Dict[str, pd.DataFrame]) -> Dict[str, object]:
         pb["best_supplier"].value_counts().idxmax() if not pb.empty and pb["best_supplier"].notna().any() else "-"
     )
 
+    dam_price_col = get_dam_market_col(market)
+
     dam_better_pct = 100 * (market["better_market"].eq("DAM").mean()) if not market.empty else np.nan
     settlement_better_pct = 100 * (market["better_market"].eq("Settlement").mean()) if not market.empty else np.nan
-    corr = market[["settlement_price", "dam_price"]].corr().iloc[0, 1] if len(market) > 1 else np.nan
+    corr = market[["settlement_price", dam_price_col]].corr().iloc[0, 1] if len(market) > 1 else np.nan
     mae = safe_mean_abs_error(market["settlement_price"], market["predicted_settlement_price"]) if not market.empty else np.nan
 
     return {
-        "avg_dam": market["dam_price"].mean() if not market.empty else np.nan,
+        "avg_dam": market[dam_price_col].mean() if not market.empty else np.nan,
         "avg_settlement": market["settlement_price"].mean() if not market.empty else np.nan,
         "avg_spread": market["spread_settlement_minus_dam"].mean() if not market.empty else np.nan,
         "avg_abs_spread": market["spread_abs"].mean() if not market.empty else np.nan,
@@ -586,7 +597,6 @@ def benchmark_section(filtered: Dict[str, pd.DataFrame], metrics: Dict[str, obje
 def solution_section(filtered: Dict[str, pd.DataFrame], metrics: Dict[str, object]) -> None:
     st.subheader("4. Business Problems, Insights, and Recommended Actions")
     pb = filtered["profile_benchmark"]
-    market = filtered["market"]
 
     if pb.empty:
         st.warning("No profiles available for recommendation output.")
